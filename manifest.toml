@@ -1,0 +1,289 @@
+schema_version = 1
+plugin_name = "pathology"
+
+[image]
+reference = "ghcr.io/auto-nomics/autonomics/pathology@sha256:a0edcb6cca25f009f669723406207651284960425f7255891be5b91b29b63f2f"
+tag = "cpu-r1"
+upstream = "in-house pathology Stage-A/B runner (pathology_runner.py) on python:3.11.11-slim with torch 2.3.1 CPU, tiffslide 2.4.0, timm 1.0.3"
+license = "MIT"
+
+# Baked-runner family: the image ENTRYPOINT is `python
+# /opt/pathology/pathology_runner.py` and every subcommand reads its knobs
+# from one `PATHOLOGY_*_SETTINGS` JSON environment variable. The legacy
+# wrapper serialized its spec struct (minus artifact_prefix/timeout_secs)
+# into that variable with compact serde_json; here each node rebuilds the
+# exact same compact JSON through an env template, so the compiled env value
+# is byte-identical to the legacy one (see README, "Settings-JSON mapping").
+# Six of the seven nodes are pure interpreter+argv (the deseq2/timesfm
+# pattern); ihc_quant is the one variant whose wrapper injected logic
+# (optional roi_label), so it carries a script.
+#
+# No panels: the family binds no data bundles — the WSI, masks, and the
+# license-gated embedding checkpoint all arrive as input files.
+
+[[nodes]]
+kind = "pathology_wsi_ingest"
+desc = "Ingests a whole-slide image and emits a thumbnail plus metadata."
+doc = """
+Reads one WSI through tiffslide, writes a bounded thumbnail, and records
+dimensions, pyramid levels, downsamples, vendor, microns per pixel, and the
+source sha256.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/pathology_wsi_ingest"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "thumbnail.png", format = "png" },
+  { path = "slide_meta.json", format = "json" },
+]
+
+[nodes.params]
+max_thumbnail_width = { type = "int", default = 2048, min = 64.0, doc = "Longest thumbnail edge in pixels" }
+
+[nodes.command]
+interpreter = "python"
+argv = ["/opt/pathology/pathology_runner.py", "wsi-ingest"]
+
+[nodes.command.env]
+PATHOLOGY_WSI_SETTINGS = '{"max_thumbnail_width":{{ max_thumbnail_width }}}'
+
+[[nodes]]
+kind = "pathology_wsi_qc"
+desc = "Tile-level focus, tissue, and blanking QC for one slide."
+doc = """
+Samples tiles on a strided grid at one pyramid level and emits per-tile
+tissue fraction, Laplacian-variance focus, and channel means, plus
+slide-level checks (tissue present, focus acceptable, not mostly blank).
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/pathology_wsi_qc"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "tile_qc.parquet", format = "parquet" },
+  { path = "qc_summary.json", format = "json" },
+]
+
+[nodes.params]
+level = { type = "int", default = -1, min = -1.0, doc = "Pyramid level to sample; -1 picks the finest level within max_downsample" }
+max_downsample = { type = "number", default = 16.0, min = 1.0, doc = "Finest-level cap as a downsample factor when level is -1" }
+tile_size = { type = "int", default = 512, min = 64.0, doc = "Tile edge in pixels at the sampled level" }
+max_tiles = { type = "int", default = 400, min = 1.0, doc = "Upper bound on sampled tiles; the grid stride grows to fit" }
+saturation_threshold = { type = "number", default = 0.2, min = 0.0, max = 1.0, doc = "HSV saturation floor for the tissue test" }
+value_floor = { type = "number", default = 0.15, min = 0.0, max = 1.0, doc = "HSV value floor for the tissue test" }
+value_ceiling = { type = "number", default = 0.92, min = 0.0, max = 1.0, doc = "HSV value ceiling for the tissue test" }
+focus_threshold = { type = "number", default = 40.0, min = 0.0, doc = "Laplacian-variance floor for the focus check" }
+min_slide_tissue_fraction = { type = "number", default = 0.05, min = 0.0, max = 1.0, doc = "Mean tissue fraction below which the slide fails QC" }
+
+[nodes.command]
+interpreter = "python"
+argv = ["/opt/pathology/pathology_runner.py", "wsi-qc"]
+
+[nodes.command.env]
+PATHOLOGY_QC_SETTINGS = '{"level":{{ level }},"max_downsample":{{ max_downsample }},"tile_size":{{ tile_size }},"max_tiles":{{ max_tiles }},"saturation_threshold":{{ saturation_threshold }},"value_floor":{{ value_floor }},"value_ceiling":{{ value_ceiling }},"focus_threshold":{{ focus_threshold }},"min_slide_tissue_fraction":{{ min_slide_tissue_fraction }}}'
+
+[[nodes]]
+kind = "pathology_patch_sample"
+desc = "Deterministic tissue-aware patch sampling for one slide."
+doc = """
+Builds a morphologically cleaned tissue mask at a bounded working
+resolution, enumerates the full patch grid with per-patch tissue fractions,
+then deterministically selects up to max_patches candidates with a seeded
+permutation. Emits the patch table (level-0 coordinates), the tissue mask,
+and sampling metadata.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/pathology_patch_sample"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "patches.parquet", format = "parquet" },
+  { path = "tissue_mask.png", format = "png" },
+  { path = "patch_meta.json", format = "json" },
+]
+
+[nodes.params]
+level = { type = "int", default = 0, min = 0.0, doc = "Pyramid level the patch grid is defined on; coordinates are emitted as level-0 pixels either way" }
+patch_size = { type = "int", default = 256, min = 32.0, doc = "Patch edge in pixels at level" }
+max_patches = { type = "int", default = 5000, min = 1.0, doc = "Upper bound on selected patches" }
+min_tissue_fraction = { type = "number", default = 0.5, min = 0.0, max = 1.0, doc = "Minimum tissue fraction for a candidate patch to be selectable" }
+seed = { type = "int", default = 0, doc = "Seed fixing the deterministic selection among candidates" }
+mask_max_downsample = { type = "number", default = 64.0, min = 1.0, doc = "Tissue-mask pyramid level cap as a downsample factor" }
+mask_max_width = { type = "int", default = 4096, min = 256.0, doc = "Working-resolution width bound for the tissue mask" }
+mask_open_radius = { type = "int", default = 3, min = 0.0, doc = "Morphological opening radius in mask pixels; 0 disables" }
+mask_close_radius = { type = "int", default = 3, min = 0.0, doc = "Morphological closing radius in mask pixels; 0 disables" }
+mask_min_object_px = { type = "int", default = 500, min = 0.0, doc = "Mask objects below this many pixels are removed; 0 disables" }
+saturation_threshold = { type = "number", default = 0.2, min = 0.0, max = 1.0, doc = "HSV saturation floor for the tissue test" }
+value_floor = { type = "number", default = 0.15, min = 0.0, max = 1.0, doc = "HSV value floor for the tissue test" }
+value_ceiling = { type = "number", default = 0.92, min = 0.0, max = 1.0, doc = "HSV value ceiling for the tissue test" }
+
+[nodes.command]
+interpreter = "python"
+argv = ["/opt/pathology/pathology_runner.py", "patch-sample"]
+
+[nodes.command.env]
+PATHOLOGY_PATCH_SETTINGS = '{"level":{{ level }},"patch_size":{{ patch_size }},"max_patches":{{ max_patches }},"min_tissue_fraction":{{ min_tissue_fraction }},"seed":{{ seed }},"mask_max_downsample":{{ mask_max_downsample }},"mask_max_width":{{ mask_max_width }},"mask_open_radius":{{ mask_open_radius }},"mask_close_radius":{{ mask_close_radius }},"mask_min_object_px":{{ mask_min_object_px }},"saturation_threshold":{{ saturation_threshold }},"value_floor":{{ value_floor }},"value_ceiling":{{ value_ceiling }}}'
+
+[[nodes]]
+kind = "pathology_wsi_embed"
+desc = "Embeds sampled patches with a staged foundation model."
+doc = """
+Input port 0 is the WSI, port 1 the patch table from patch-sample, port 2
+the locally staged model bundle (optional model_config.json plus exactly one
+checkpoint; nothing is downloaded — UNI-class checkpoints are
+license-gated). Runs timm inference with ImageNet normalization and writes
+float32 embeddings, patch IDs, and coordinates to HDF5.
+
+The node always runs with the GPU passthrough of the family image
+(resources gpus = "all"); `device` still selects auto/cpu/cuda inside
+torch, so the same node serves CPU-only execution on hosts where the
+runtime can satisfy the request without a visible accelerator.
+"""
+timeout_secs = 7200
+artifact_prefix = "/artifacts/pathology_wsi_embed"
+
+[nodes.ports]
+inputs = [
+  { type = "file", label = "wsi" },
+  { type = "file", label = "patch_table" },
+  { type = "file", label = "model_weights" },
+]
+outputs = [
+  { path = "embeddings.h5", format = "hdf5" },
+  { path = "embed_meta.json", format = "json" },
+]
+
+[nodes.params]
+batch_size = { type = "int", default = 32, min = 1.0, doc = "Patches forwarded per inference step" }
+device = { type = "string", default = "auto", doc = "Torch device: auto (CUDA when visible), cpu, or cuda" }
+amp = { type = "bool", default = false, doc = "FP16 autocast on CUDA devices" }
+
+[nodes.resources]
+gpus = "all"
+
+[nodes.command]
+interpreter = "python"
+argv = ["/opt/pathology/pathology_runner.py", "wsi-embed"]
+
+[nodes.command.env]
+# gpus stays in the blob (hardcoded to the same value as
+# [nodes.resources].gpus) for byte parity with the legacy env; the runner
+# itself only reads batch_size, device, and amp.
+PATHOLOGY_EMBED_SETTINGS = '{"batch_size":{{ batch_size }},"device":"{{ device }}","amp":{{ amp }},"gpus":"all"}'
+
+[[nodes]]
+kind = "pathology_domain_check"
+desc = "Compares two embedding tables for batch effects."
+doc = """
+Input port 0 is the reference embedding table and port 1 the comparison
+table. Emits centroid cosine and shrunk-covariance Mahalanobis distances,
+batch silhouette (seeded subsample), and the most shifted dimensions, for
+deciding whether cohorts may be pooled.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/pathology_domain_check"
+
+[nodes.ports]
+inputs = [
+  { type = "file", label = "reference_embeddings" },
+  { type = "file", label = "comparison_embeddings" },
+]
+outputs = [
+  { path = "domain_metrics.parquet", format = "parquet" },
+  { path = "domain_meta.json", format = "json" },
+]
+
+[nodes.params]
+l2_normalize = { type = "bool", default = true, doc = "L2-normalize embeddings before the distance computations" }
+shrinkage = { type = "number", default = 0.1, min = 0.0, exclusive_max = 1.0, doc = "Ledoit-style diagonal shrinkage of the pooled covariance" }
+silhouette_max_samples = { type = "int", default = 20000, min = 2.0, doc = "Silhouette subsample cap for large embedding tables" }
+seed = { type = "int", default = 0, doc = "Seed fixing the silhouette subsample" }
+
+[nodes.command]
+interpreter = "python"
+argv = ["/opt/pathology/pathology_runner.py", "domain-check"]
+
+[nodes.command.env]
+PATHOLOGY_DOMAIN_SETTINGS = '{"l2_normalize":{{ l2_normalize }},"shrinkage":{{ shrinkage }},"silhouette_max_samples":{{ silhouette_max_samples }},"seed":{{ seed }}}'
+
+[[nodes]]
+kind = "pathology_ihc_quant"
+desc = "Quantifies DAB positivity and H-score inside an ROI."
+doc = """
+Input port 0 is the WSI and port 1 an ROI mask image with a configured
+mask-to-level-0 scale. Decomposes tiles into hematoxylin/DAB channels,
+thresholds DAB positivity in three intensity bins, and emits per-tile
+tables plus a slide-level H-score.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/pathology_ihc_quant"
+
+[nodes.ports]
+inputs = [
+  { type = "file", label = "wsi" },
+  { type = "file", label = "roi_mask" },
+]
+outputs = [
+  { path = "tile_ihc.parquet", format = "parquet" },
+  { path = "ihc_summary.json", format = "json" },
+]
+
+[nodes.params]
+roi_label = { type = "int", optional = true, doc = "Label to quantify inside the ROI mask; the smallest mask label when omitted" }
+mask_downsample = { type = "number", default = 16.0, min = 1.0, doc = "ROI mask pixels per level-0 pixel (mask level / level-0 scale factor)" }
+dab_weak_threshold = { type = "number", default = 0.15, exclusive_min = 0.0, doc = "Weak DAB cutoff in rgb2hed concentration units" }
+dab_strong_threshold = { type = "number", default = 0.35, exclusive_min = 0.0, doc = "Strong DAB cutoff; must stay above dab_weak_threshold (the runner enforces the ordering)" }
+max_downsample = { type = "number", default = 4.0, min = 1.0, doc = "Finest analysis level cap as a downsample factor" }
+tile_size = { type = "int", default = 512, min = 64.0, doc = "Tile edge in pixels at the analysis level" }
+max_tiles = { type = "int", default = 20000, min = 1.0, doc = "Upper bound on quantified tiles" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/ihc_quant.sh"
+
+[nodes.command.env]
+PATHOLOGY_IHC_ROI_LABEL = "{{ roi_label }}"
+PATHOLOGY_IHC_MASK_DOWNSAMPLE = "{{ mask_downsample }}"
+PATHOLOGY_IHC_DAB_WEAK_THRESHOLD = "{{ dab_weak_threshold }}"
+PATHOLOGY_IHC_DAB_STRONG_THRESHOLD = "{{ dab_strong_threshold }}"
+PATHOLOGY_IHC_MAX_DOWNSAMPLE = "{{ max_downsample }}"
+PATHOLOGY_IHC_TILE_SIZE = "{{ tile_size }}"
+PATHOLOGY_IHC_MAX_TILES = "{{ max_tiles }}"
+
+[[nodes]]
+kind = "pathology_qupath_import"
+desc = "Exports a label mask as QuPath GeoJSON annotations."
+doc = """
+Input port 0 is a label mask and port 1 the reference WSI. Traces,
+simplifies, and scales region contours to level-0 pixels and emits a
+QuPath-compatible FeatureCollection with classification names.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/pathology_qupath_import"
+
+[nodes.ports]
+inputs = [
+  { type = "file", label = "annotation_mask" },
+  { type = "file", label = "reference_wsi" },
+]
+outputs = [
+  { path = "annotations.geojson", format = "geojson" },
+  { path = "geojson_meta.json", format = "json" },
+]
+
+[nodes.params]
+mask_downsample = { type = "number", default = 16.0, min = 1.0, doc = "Label-mask pixels per level-0 pixel (mask level / level-0 scale factor)" }
+label_names = { type = "string", default = "{}", doc = "JSON object mapping label value to classification name, for example {\"1\":\"Tumor\"}; embedded verbatim into the settings blob, keys must be integers" }
+simplify_tolerance_px = { type = "number", default = 2.0, min = 0.0, doc = "Douglas-Peucker tolerance in mask pixels" }
+min_region_px = { type = "int", default = 200, min = 0.0, doc = "Regions below this many mask pixels are dropped; 0 keeps all" }
+
+[nodes.command]
+interpreter = "python"
+argv = ["/opt/pathology/pathology_runner.py", "qupath-import"]
+
+[nodes.command.env]
+PATHOLOGY_QUPATH_SETTINGS = '{"mask_downsample":{{ mask_downsample }},"label_names":{{ label_names }},"simplify_tolerance_px":{{ simplify_tolerance_px }},"min_region_px":{{ min_region_px }}}'
