@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -61,7 +62,13 @@ def sha256(path: Path) -> str:
 
 
 def settings_env(name: str) -> dict[str, Any]:
-    return json.loads(os.environ.get(name, "{}"))
+    raw = os.environ.get(name, "{}")
+    # The host renders an explicitly-disabled boolean as "" (presence
+    # semantics), which inside the manifest's JSON template literals leaves
+    # an empty value where `false` belongs (`"amp":,`). Repair exactly that
+    # shape: an empty JSON value reads as false, never as absent-or-error.
+    raw = re.sub(r":(\s*[}\],])", r":false\1", raw)
+    return json.loads(raw)
 
 
 def write_json(index: int, payload: dict[str, Any]) -> None:
